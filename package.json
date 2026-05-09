@@ -1,10 +1,18 @@
 {
   "name": "pi-scream",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Usage limits extension for pi coding agent",
   "type": "module",
   "license": "MIT",
   "author": "Henry Zhu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daya0576/pi-scream.git"
+  },
+  "homepage": "https://github.com/daya0576/pi-scream#readme",
+  "bugs": {
+    "url": "https://github.com/daya0576/pi-scream/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
