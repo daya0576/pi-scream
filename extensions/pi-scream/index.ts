@@ -4,16 +4,22 @@ import path from "node:path";
 import { AuthStorage, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
-type UsageProviderKey = "codex" | "claude";
+type UsageProviderKey = "codex" | "claude" | "github-copilot";
 
 interface UsageData {
   window: number;
   weekly: number;
   windowLabel: string;
+  weeklyLabel?: string;
+  windowDetail?: string;
+  weeklyDetail?: string;
   windowResetsIn?: string;
   weeklyResetsIn?: string;
   windowResetProgress?: number;
   weeklyResetProgress?: number;
+  planLabel?: string;
+  refreshedAt?: number;
+  debugLines?: string[];
   error?: string;
 }
 
@@ -23,7 +29,18 @@ interface UsageProvider {
   oauthProviderId: string;
   statusUrl?: string;
   matches(provider: string, modelId: string): boolean;
+  getToken?(auth: AuthStorage): Promise<string | undefined>;
   fetch(token: string, signal?: AbortSignal): Promise<UsageData>;
+}
+
+interface CopilotQuotaSnapshot {
+  entitlement?: number;
+  overage_count?: number;
+  percent_remaining?: number;
+  quota_remaining?: number;
+  remaining?: number;
+  unlimited?: boolean;
+  timestamp_utc?: string;
 }
 
 const CACHE_TTL_MS = 60_000;
@@ -33,6 +50,7 @@ const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "pi-scream-cache.json
 const cache = new Map<UsageProviderKey, { data: UsageData; at: number }>();
 
 let currentContext: ExtensionContext | undefined;
+let selectedModel: ExtensionContext["model"] | undefined;
 let usageInlineText: string | undefined;
 let requestFooterRender: (() => void) | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
@@ -80,6 +98,16 @@ function formatDuration(seconds: number): string {
   return "<1m";
 }
 
+function formatTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString(undefined, { hour12: false });
+}
+
+function formatRefreshTime(timestamp: number | undefined): string | undefined {
+  if (!timestamp || !Number.isFinite(timestamp)) return undefined;
+  const ageSeconds = Math.max(0, (Date.now() - timestamp) / 1000);
+  return `${formatTime(timestamp)} (${formatDuration(ageSeconds)} ago)`;
+}
+
 function secondsUntil(isoDate: string): number | undefined {
   const resetTime = new Date(isoDate).getTime();
   if (!Number.isFinite(resetTime)) return undefined;
@@ -101,6 +129,104 @@ function percent(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, Number(n.toFixed(1))));
+}
+
+function usedPercentFromRemaining(value: unknown): number {
+  const remaining = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(remaining)) return 0;
+  return percent(100 - remaining);
+}
+
+function quotaUsedPercent(snapshot: CopilotQuotaSnapshot | undefined): number {
+  if (!snapshot || snapshot.unlimited) return 0;
+  if (typeof snapshot.percent_remaining === "number") return usedPercentFromRemaining(snapshot.percent_remaining);
+
+  const remaining = typeof snapshot.remaining === "number" ? snapshot.remaining : snapshot.quota_remaining;
+  if (typeof remaining === "number" && typeof snapshot.entitlement === "number" && snapshot.entitlement > 0) {
+    return percent(((snapshot.entitlement - remaining) / snapshot.entitlement) * 100);
+  }
+
+  return 0;
+}
+
+function quotaDetail(snapshot: CopilotQuotaSnapshot | undefined): string | undefined {
+  if (!snapshot) return undefined;
+  if (snapshot.unlimited) return "unlimited";
+
+  const remaining = typeof snapshot.remaining === "number" ? snapshot.remaining : snapshot.quota_remaining;
+  const parts: string[] = [];
+  if (typeof remaining === "number" && typeof snapshot.entitlement === "number") parts.push(`${snapshot.entitlement - remaining}/${snapshot.entitlement}`);
+  else if (typeof remaining === "number") parts.push(`${remaining} used`);
+  if (typeof snapshot.overage_count === "number" && snapshot.overage_count > 0) parts.push(`${snapshot.overage_count} overage`);
+  return parts.length ? parts.join(", ") : undefined;
+}
+
+function resetProgressFromDate(isoDate: string | undefined, totalSeconds: number): number | undefined {
+  if (!isoDate) return undefined;
+  return resetProgress(secondsUntil(isoDate), totalSeconds);
+}
+
+function getGitHubApiBaseFromCopilotCredential(auth: AuthStorage): string {
+  const credential = auth.get("github-copilot") as { enterpriseUrl?: string } | undefined;
+  const rawDomain = credential?.enterpriseUrl?.trim() || "github.com";
+  let domain = rawDomain;
+  try {
+    domain = rawDomain.includes("://") ? new URL(rawDomain).hostname : new URL(`https://${rawDomain}`).hostname;
+  } catch {
+    domain = rawDomain;
+  }
+  return `https://api.${domain}`;
+}
+
+async function getGitHubCopilotRefreshToken(auth: AuthStorage): Promise<string | undefined> {
+  await auth.getApiKey("github-copilot");
+  const credential = auth.get("github-copilot") as { refresh?: string } | undefined;
+  return credential?.refresh;
+}
+
+function normalizePlanLabel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase()
+    .replace(/^claude[_ -]?/, "")
+    .replace(/^anthropic[_ -]?/, "")
+    .replace(/^individual[_ -]?/, "")
+    .replace(/^plan[_ -]?/, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\bpro plus\b/g, "pro+")
+    .trim();
+  return normalized || undefined;
+}
+
+function extractCopilotPlanLabel(data: any, premium: CopilotQuotaSnapshot | undefined): string | undefined {
+  const labels = [data?.copilot_plan, data?.access_type_sku]
+    .map(normalizePlanLabel)
+    .filter((label): label is string => Boolean(label));
+
+  const explicitProPlus = labels.find((label) => label === "pro+" || label.includes("pro+"));
+  if (explicitProPlus) return explicitProPlus;
+
+  const first = labels[0];
+  if (first === "pro" && typeof premium?.entitlement === "number" && premium.entitlement >= 1500) return "pro+";
+  return first;
+}
+
+function extractPlanLabel(data: any): string | undefined {
+  const candidates = [
+    data?.subscription?.plan,
+    data?.subscription?.tier,
+    data?.plan,
+    data?.tier,
+    data?.account?.plan,
+    data?.account?.tier,
+    data?.organization?.plan,
+    data?.organization?.tier,
+    data?.billing?.plan,
+  ];
+  for (const candidate of candidates) {
+    const label = normalizePlanLabel(candidate);
+    if (label) return label;
+  }
+  return undefined;
 }
 
 async function fetchJson(url: string, token: string, signal?: AbortSignal): Promise<any> {
@@ -140,8 +266,8 @@ const providers: UsageProvider[] = [
     key: "claude",
     label: "Claude",
     oauthProviderId: "anthropic",
-    statusUrl: "https://status.anthropic.com/",
-    matches: (provider) => provider === "anthropic",
+    statusUrl: "https://claude.ai/settings/usage",
+    matches: (provider) => provider === "anthropic" || provider === "claude",
     async fetch(token, signal) {
       const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
         signal,
@@ -162,6 +288,50 @@ const providers: UsageProvider[] = [
         weeklyResetsIn: weeklyResetSeconds !== undefined ? formatDuration(weeklyResetSeconds) : undefined,
         windowResetProgress: resetProgress(fiveHourResetSeconds, 5 * 60 * 60),
         weeklyResetProgress: resetProgress(weeklyResetSeconds, 7 * 24 * 60 * 60),
+        planLabel: extractPlanLabel(data),
+      };
+    },
+  },
+  {
+    key: "github-copilot",
+    label: "Copilot",
+    oauthProviderId: "github-copilot",
+    statusUrl: "https://github.com/settings/copilot",
+    matches: (provider) => provider === "github-copilot",
+    getToken: getGitHubCopilotRefreshToken,
+    async fetch(token, signal) {
+      const auth = AuthStorage.create();
+      const baseUrl = getGitHubApiBaseFromCopilotCredential(auth);
+      const data = await fetchJson(`${baseUrl}/copilot_internal/user`, token, signal);
+      const premium = data?.quota_snapshots?.premium_interactions as CopilotQuotaSnapshot | undefined;
+      const chat = data?.quota_snapshots?.chat as CopilotQuotaSnapshot | undefined;
+      const resetDate = data?.quota_reset_date_utc || data?.quota_reset_date || data?.limited_user_reset_date;
+      const resetSeconds = resetDate ? secondsUntil(resetDate) : undefined;
+      const planLabel = extractCopilotPlanLabel(data, premium);
+
+      return {
+        windowLabel: "premium",
+        window: quotaUsedPercent(premium),
+        weeklyLabel: "chat",
+        weekly: quotaUsedPercent(chat),
+        windowDetail: quotaDetail(premium),
+        weeklyDetail: quotaDetail(chat),
+        windowResetsIn: resetSeconds !== undefined ? formatDuration(resetSeconds) : undefined,
+        weeklyResetsIn: resetSeconds !== undefined ? formatDuration(resetSeconds) : undefined,
+        windowResetProgress: resetProgressFromDate(resetDate, 30 * 24 * 60 * 60),
+        weeklyResetProgress: resetProgressFromDate(resetDate, 30 * 24 * 60 * 60),
+        planLabel,
+        debugLines: [
+          `copilot_plan=${String(data?.copilot_plan ?? "(missing)")}`,
+          `access_type_sku=${String(data?.access_type_sku ?? "(missing)")}`,
+          `premium.entitlement=${String(premium?.entitlement ?? "(missing)")}`,
+          `premium.remaining=${String(premium?.remaining ?? premium?.quota_remaining ?? "(missing)")}`,
+          `premium.percent_remaining=${String(premium?.percent_remaining ?? "(missing)")}`,
+          `premium.unlimited=${String(premium?.unlimited ?? "(missing)")}`,
+          `quota_reset_date_utc=${String(data?.quota_reset_date_utc ?? "(missing)")}`,
+          `quota_reset_date=${String(data?.quota_reset_date ?? "(missing)")}`,
+          `limited_user_reset_date=${String(data?.limited_user_reset_date ?? "(missing)")}`,
+        ],
       };
     },
   },
@@ -185,16 +355,21 @@ async function withTimeout<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<
 async function getUsage(provider: UsageProvider, force = false): Promise<UsageData> {
   loadCache();
   const cached = cache.get(provider.key);
-  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data;
+  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    cached.data.refreshedAt = cached.data.refreshedAt ?? cached.at;
+    return cached.data;
+  }
 
   try {
-    const token = await AuthStorage.create().getApiKey(provider.oauthProviderId);
+    const auth = AuthStorage.create();
+    const token = provider.getToken ? await provider.getToken(auth) : await auth.getApiKey(provider.oauthProviderId);
     if (!token) {
       return { windowLabel: "5h", window: 0, weekly: 0, error: `missing ${provider.oauthProviderId} token; try /login` };
     }
 
     const data = await withTimeout((signal) => provider.fetch(token, signal));
-    cache.set(provider.key, { data, at: Date.now() });
+    data.refreshedAt = Date.now();
+    cache.set(provider.key, { data, at: data.refreshedAt });
     saveCache();
     return data;
   } catch (err) {
@@ -209,7 +384,7 @@ async function getUsage(provider: UsageProvider, force = false): Promise<UsageDa
 
 function compactUsage(provider: UsageProvider, data: UsageData): string {
   if (data.error) return `${provider.label}: ${data.error}`;
-  return `Codex (plus) ${renderPlainBar(data.window, data.windowResetProgress)} ${data.window}%`;
+  return `${providerDisplayName(provider, data)} ${renderPlainBar(data.window, data.windowResetProgress)} ${data.window}%`;
 }
 
 function renderPlainBar(value: number, resetMarkerPercent?: number, width = 20): string {
@@ -227,29 +402,36 @@ function renderPlainBar(value: number, resetMarkerPercent?: number, width = 20):
   return bar;
 }
 
-function providerDisplayName(provider: UsageProvider): string {
-  if (provider.key === "codex") return "Codex (plus) [premium]";
-  return `${provider.label} [premium]`;
+function providerDisplayName(provider: UsageProvider, data?: UsageData): string {
+  if (provider.key === "codex") return "Codex (plus)";
+  if (data?.planLabel) return `${provider.label} (${data.planLabel})`;
+  return provider.label;
 }
 
-function usageText(provider: UsageProvider, data: UsageData): string {
+function usageLine(label: string, value: number, resetProgressPercent?: number, detail?: string): string {
+  return `  ${label.padEnd(7)} ${renderPlainBar(value, resetProgressPercent)} ${value}%${detail ? ` (${detail})` : ""}`;
+}
+
+function usageSourceLine(provider: UsageProvider, data: UsageData): string | undefined {
+  const refreshed = formatRefreshTime(data.refreshedAt);
+  if (provider.statusUrl) return `- ${provider.statusUrl}${refreshed ? ` - refreshed ${refreshed}` : ""}`;
+  if (refreshed) return `- refreshed ${refreshed}`;
+  return undefined;
+}
+
+function usageText(provider: UsageProvider, data: UsageData, debug = false): string {
   if (data.error) {
     return [
-      "Usage Limits",
-      "----------------------------------------",
       provider.label,
       `  error ${data.error}`,
-      ...(provider.statusUrl ? ["", provider.statusUrl] : []),
     ].join("\n");
   }
 
   return [
-    "Usage Limits",
-    "----------------------------------------",
-    providerDisplayName(provider),
-    `  ${data.windowLabel.padEnd(5)} ${renderPlainBar(data.window, data.windowResetProgress)} ${data.window}%`,
-    `  ${"week".padEnd(5)} ${renderPlainBar(data.weekly, data.weeklyResetProgress)} ${data.weekly}%`,
-    ...(provider.statusUrl ? ["", provider.statusUrl] : []),
+    providerDisplayName(provider, data),
+    usageLine(data.windowLabel, data.window, data.windowResetProgress, data.windowDetail),
+    usageLine(data.weeklyLabel ?? "week", data.weekly, data.weeklyResetProgress, data.weeklyDetail),
+    ...(debug && data.debugLines?.length ? ["", "Debug", ...data.debugLines.map((line) => `  ${line}`)] : []),
   ].join("\n");
 }
 
@@ -263,6 +445,7 @@ function formatTokens(count: number): string {
 
 function installFooter(ctx: ExtensionContext) {
   currentContext = ctx;
+  selectedModel = ctx.model;
 
   ctx.ui.setFooter((tui, theme, footerData) => {
     requestFooterRender = () => tui.requestRender();
@@ -301,7 +484,7 @@ function installFooter(ctx: ExtensionContext) {
         if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
         if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
 
-        const model = activeCtx.model;
+        const model = selectedModel ?? activeCtx.model;
         const usingSubscription = model ? activeCtx.modelRegistry.isUsingOAuth(model as any) : false;
         if (totalCost || usingSubscription) statsParts.push(`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
 
@@ -378,7 +561,7 @@ async function refreshCurrentUsage(force = false) {
   const ctx = currentContext;
   if (!ctx || refreshInFlight) return;
 
-  const provider = detectUsageProvider(ctx.model);
+  const provider = detectUsageProvider(selectedModel ?? ctx.model);
   if (!provider) {
     usageInlineText = undefined;
     requestFooterRender?.();
@@ -411,6 +594,9 @@ export default function (pi: ExtensionAPI) {
   loadCache();
 
   pi.on("model_select", async (event, ctx) => {
+    currentContext = ctx;
+    selectedModel = event.model;
+    requestFooterRender?.();
     await updateStatus(ctx, detectUsageProvider(event.model));
   });
 
@@ -425,19 +611,43 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("usage", {
-    description: "Show current provider usage (pi-scream)",
-    handler: async (_args, ctx) => {
-      const provider = detectUsageProvider(ctx.model);
-      if (!provider) {
+    description: "Show provider usage: /usage [all|codex|claude|github-copilot|copilot] [refresh] [debug] (pi-scream)",
+    handler: async (args, ctx) => {
+      const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const force = tokens.some((token) => token === "refresh" || token === "--refresh" || token === "-f");
+      const debug = tokens.some((token) => token === "debug" || token === "--debug");
+      const requested = tokens.find((token) => token !== "refresh" && token !== "--refresh" && token !== "-f" && token !== "debug" && token !== "--debug") ?? "all";
+      const selectedProviders = requested === "all"
+        ? providers
+        : providers.filter((p) => p.key === requested || p.label.toLowerCase() === requested || (requested === "copilot" && p.key === "github-copilot"));
+
+      if (selectedProviders.length === 0) {
         const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
-        ctx.ui.notify(`pi-scream: usage is not supported for current model (${current})`, "warning");
+        const hint = requested ? `unknown usage provider "${requested}"` : `usage is not supported for current model (${current})`;
+        ctx.ui.notify(`pi-scream: ${hint}; try /usage codex, /usage claude, /usage copilot, or /usage all`, "warning");
         return;
       }
 
-      const data = await getUsage(provider);
-      usageInlineText = compactUsage(provider, data);
+      const results = await Promise.all(selectedProviders.map(async (provider) => {
+        const data = await getUsage(provider, force);
+        return { provider, data };
+      }));
+
+      const activeProvider = detectUsageProvider(ctx.model) ?? results[0]?.provider;
+      const activeResult = results.find((result) => result.provider === activeProvider) ?? results[0];
+      usageInlineText = activeResult ? compactUsage(activeResult.provider, activeResult.data) : undefined;
       requestFooterRender?.();
-      ctx.ui.notify(usageText(provider, data), data.error ? "error" : "info");
+
+      const sourceLines = results
+        .map(({ provider, data }) => usageSourceLine(provider, data))
+        .filter((line): line is string => line !== undefined);
+      const text = [
+        ...(sourceLines.length > 0 ? ["Source", "----------------------------------------", ...sourceLines, ""] : []),
+        "Usage Limits",
+        "----------------------------------------",
+        results.map(({ provider, data }) => usageText(provider, data, debug)).join("\n\n"),
+      ].join("\n");
+      ctx.ui.notify(text, results.some(({ data }) => data.error) ? "error" : "info");
     },
   });
 }

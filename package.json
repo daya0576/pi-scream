@@ -11,7 +11,9 @@
     "extension",
     "usage",
     "quota",
-    "codex"
+    "codex",
+    "github-copilot",
+    "copilot"
   ],
   "pi": {
     "extensions": [

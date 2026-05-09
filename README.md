@@ -30,11 +30,19 @@ The `|` marker indicates reset-window progress. For example, in a 5h window:
 
 ## Features
 
-- Shows Codex usage in the footer/status bar.
+- Shows Codex, Claude, and GitHub Copilot usage in the footer/status bar.
 - Refreshes usage in the background every minute.
 - Persists the latest usage cache to `~/.pi/agent/pi-scream-cache.json`.
 - Adds a `/usage` command for a compact usage summary.
-- Designed to support more providers over time. Codex and Claude provider hooks are included.
+- Designed to support more providers over time. Codex, Claude, and GitHub Copilot provider hooks are included.
+
+## Provider titles
+
+| Provider | Title logic | Examples | Plan reliability |
+|---|---|---|---|
+| Codex | Fixed title | `Codex (plus)` | Fixed/manual |
+| Claude | `Claude` only; plan usually unavailable from API | `Claude` | Low |
+| Copilot | `Copilot` + optional normalized plan | `Copilot`, `Copilot (pro)`, `Copilot (pro+)` | Medium |
 
 ## Usage
 
@@ -58,6 +66,8 @@ Run:
 
 ```text
 /usage
+/usage copilot
+/usage all refresh
 ```
 
 ## Local development
@@ -95,6 +105,8 @@ After changing extension files, run:
 ## Notes
 
 Codex usage is read from ChatGPT's usage endpoint using the `openai-codex` OAuth token already managed by pi.
+
+GitHub Copilot usage is read from GitHub's Copilot user API using the `github-copilot` OAuth credentials already managed by pi. The extension displays premium interaction and chat quota snapshots when GitHub returns them.
 
 ## License
 
