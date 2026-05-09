@@ -18,7 +18,8 @@
   "pi": {
     "extensions": [
       "./extensions/pi-scream/index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/daya0576/pi-scream/main/assets/pi-scream.png"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
