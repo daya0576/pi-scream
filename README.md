@@ -1,6 +1,6 @@
 # pi-scream
 
-A minimal usage limits extension for [pi coding agent](https://github.com/mariozechner/pi-coding-agent).
+A usage limits extension for [pi coding agent](https://github.com/mariozechner/pi-coding-agent) that shows Codex, Claude, and GitHub Copilot quota status in a command and the status bar.
 
 ## Demo
 
@@ -44,16 +44,18 @@ The `|` marker indicates reset-window progress. For example, in a 5h window:
 | Claude | Anthropic OAuth usage endpoint; plan type usually unavailable | `anthropic` OAuth token managed by pi |
 | GitHub Copilot | GitHub Copilot user API; premium interaction and chat quota snapshots when returned | `github-copilot` OAuth credentials managed by pi |
 
-## Usage
+## Installation
 
-Install as a pi package or place the extension in your pi extensions directory.
+Install from npm:
 
-```json
-{
-  "packages": [
-    "github:daya0576/pi-scream"
-  ]
-}
+```bash
+pi install npm:pi-scream
+```
+
+Or install from GitHub:
+
+```bash
+pi install git:github.com/daya0576/pi-scream
 ```
 
 Then reload pi:
@@ -61,6 +63,8 @@ Then reload pi:
 ```text
 /reload
 ```
+
+## Usage
 
 Run:
 
