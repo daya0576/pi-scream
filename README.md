@@ -2,6 +2,32 @@
 
 A minimal usage limits extension for [pi coding agent](https://github.com/mariozechner/pi-coding-agent).
 
+## Demo
+
+`/usage`:
+
+```text
+Usage Limits
+----------------------------------------
+Codex (plus) [premium]
+  5h    #######........|.... 33%
+  week  ##|................. 8%
+
+https://chatgpt.com/codex/cloud/settings/analytics
+```
+
+Footer/status bar:
+
+```text
+Codex (plus) #######........|.... 33%
+```
+
+The `|` marker indicates reset-window progress. For example, in a 5h window:
+
+- reset in 5h -> marker near 0%
+- reset in 1h -> marker near 80%
+- reset now -> marker near 100%
+
 ## Features
 
 - Shows Codex usage in the footer/status bar.
@@ -34,33 +60,41 @@ Run:
 /usage
 ```
 
-Example output:
+## Local development
+
+This repository lives at:
 
 ```text
-Usage Limits
-----------------------------------------
-Codex (plus) [premium]
-  5h    #######........|.... 33%
-  week  ##|................. 8%
-
-https://chatgpt.com/codex/cloud/settings/analytics
+/Users/henry/repo/private/pi-scream
 ```
 
-Footer example:
+The extension currently loaded by your local pi setup is a separate working copy at:
 
 ```text
-Codex (plus) #######........|.... 33%
+/Users/henry/.pi/agent/extensions/pi-scream.ts
+```
+
+Relationship:
+
+- The repo copy is the publishable package source:
+
+  ```text
+  extensions/pi-scream/index.ts
+  ```
+
+- The `~/.pi/agent/extensions/pi-scream.ts` copy is the active local extension that pi auto-discovers.
+- Right now they are identical, but edits to one do not automatically update the other.
+- If you install this repo via `packages` in pi settings, you can remove the standalone local copy to avoid maintaining two copies.
+
+After changing extension files, run:
+
+```text
+/reload
 ```
 
 ## Notes
 
 Codex usage is read from ChatGPT's usage endpoint using the `openai-codex` OAuth token already managed by pi.
-
-The `|` marker indicates reset-window progress. For example, in a 5h window:
-
-- reset in 5h -> marker near 0%
-- reset in 1h -> marker near 80%
-- reset now -> marker near 100%
 
 ## License
 
