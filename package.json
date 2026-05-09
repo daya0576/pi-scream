@@ -1,0 +1,25 @@
+{
+  "name": "pi-scream",
+  "version": "0.1.0",
+  "description": "Usage limits extension for pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "Henry Zhu",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "usage",
+    "quota",
+    "codex"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi-scream/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
