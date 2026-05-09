@@ -28,14 +28,6 @@ The `|` marker indicates reset-window progress. For example, in a 5h window:
 - reset in 1h -> marker near 80%
 - reset now -> marker near 100%
 
-## Features
-
-- Shows Codex, Claude, and GitHub Copilot usage in the footer/status bar.
-- Refreshes usage in the background every minute.
-- Persists the latest usage cache to `~/.pi/agent/pi-scream-cache.json`.
-- Adds a `/usage` command for a compact usage summary.
-- Designed to support more providers over time. Codex, Claude, and GitHub Copilot provider hooks are included.
-
 ## Provider titles
 
 | Provider | Title logic | Examples | Plan reliability |
@@ -43,6 +35,14 @@ The `|` marker indicates reset-window progress. For example, in a 5h window:
 | Codex | Fixed title | `Codex (plus)` | Fixed/manual |
 | Claude | `Claude` only; plan usually unavailable from API | `Claude` | Low |
 | Copilot | `Copilot` + optional normalized plan | `Copilot`, `Copilot (pro)`, `Copilot (pro+)` | Medium |
+
+## Provider data sources
+
+| Provider | Source | Auth |
+|---|---|---|
+| Codex | ChatGPT usage endpoint | `openai-codex` OAuth token managed by pi |
+| Claude | Anthropic OAuth usage endpoint; plan type usually unavailable | `anthropic` OAuth token managed by pi |
+| GitHub Copilot | GitHub Copilot user API; premium interaction and chat quota snapshots when returned | `github-copilot` OAuth credentials managed by pi |
 
 ## Usage
 
@@ -69,44 +69,6 @@ Run:
 /usage copilot
 /usage all refresh
 ```
-
-## Local development
-
-This repository lives at:
-
-```text
-/Users/henry/repo/private/pi-scream
-```
-
-The extension currently loaded by your local pi setup is a separate working copy at:
-
-```text
-/Users/henry/.pi/agent/extensions/pi-scream.ts
-```
-
-Relationship:
-
-- The repo copy is the publishable package source:
-
-  ```text
-  extensions/pi-scream/index.ts
-  ```
-
-- The `~/.pi/agent/extensions/pi-scream.ts` copy is the active local extension that pi auto-discovers.
-- Right now they are identical, but edits to one do not automatically update the other.
-- If you install this repo via `packages` in pi settings, you can remove the standalone local copy to avoid maintaining two copies.
-
-After changing extension files, run:
-
-```text
-/reload
-```
-
-## Notes
-
-Codex usage is read from ChatGPT's usage endpoint using the `openai-codex` OAuth token already managed by pi.
-
-GitHub Copilot usage is read from GitHub's Copilot user API using the `github-copilot` OAuth credentials already managed by pi. The extension displays premium interaction and chat quota snapshots when GitHub returns them.
 
 ## License
 

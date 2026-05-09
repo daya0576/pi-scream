@@ -267,7 +267,7 @@ const providers: UsageProvider[] = [
     label: "Claude",
     oauthProviderId: "anthropic",
     statusUrl: "https://claude.ai/settings/usage",
-    matches: (provider) => provider === "anthropic" || provider === "claude",
+    matches: (provider, modelId) => provider === "anthropic" || provider === "claude" || (provider === "meridian" && modelId.includes("claude")),
     async fetch(token, signal) {
       const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
         signal,
