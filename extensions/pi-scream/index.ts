@@ -361,19 +361,12 @@ async function updateStatus(ctx: ExtensionContext, provider: UsageProvider | und
     return;
   }
 
-  if (!force) {
-    loadCache();
-    const cached = cache.get(provider.key);
-    if (cached) {
-      usageInlineText = compactUsage(provider, cached.data);
-      requestFooterRender?.();
-      return;
-    }
-  }
-
-  if (!usageInlineText || force) {
-    usageInlineText = `${provider.label}: ...`;
+  loadCache();
+  const cached = cache.get(provider.key);
+  if (cached) {
+    usageInlineText = compactUsage(provider, cached.data);
     requestFooterRender?.();
+    if (!force) return;
   }
 
   const data = await getUsage(provider, force);
