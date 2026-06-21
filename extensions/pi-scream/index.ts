@@ -21,6 +21,7 @@ interface UsageData {
   refreshedAt?: number;
   debugLines?: string[];
   error?: string;
+  errorBackoffMs?: number;
 }
 
 interface UsageProvider {
@@ -44,9 +45,14 @@ interface CopilotQuotaSnapshot {
 }
 
 const CACHE_TTL_MS = 60_000;
+const ERROR_BACKOFF_BASE_MS = 60_000;
+const ERROR_BACKOFF_MAX_MS = 15 * 60_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 const BACKGROUND_REFRESH_MS = 60_000;
 const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "pi-scream-cache.json");
+const LOCK_DIR = path.join(os.homedir(), ".pi", "agent", "pi-scream-cache.lock");
+const LOCK_STALE_MS = REQUEST_TIMEOUT_MS + 5_000;
+const WAIT_POLL_MS = 250;
 const cache = new Map<UsageProviderKey, { data: UsageData; at: number }>();
 
 let currentContext: ExtensionContext | undefined;
@@ -56,20 +62,28 @@ let requestFooterRender: (() => void) | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
 let refreshInFlight = false;
 let cacheLoaded = false;
+let cacheWatcher: fs.FSWatcher | undefined;
 
 function loadCache() {
   if (cacheLoaded) return;
   cacheLoaded = true;
+  reloadCacheFromDisk();
+}
 
+function reloadCacheFromDisk() {
+  let parsed: Partial<Record<UsageProviderKey, { data: UsageData; at: number }>>;
   try {
-    const raw = fs.readFileSync(CACHE_FILE, "utf8");
-    const parsed = JSON.parse(raw) as Partial<Record<UsageProviderKey, { data: UsageData; at: number }>>;
-    for (const key of Object.keys(parsed) as UsageProviderKey[]) {
-      const entry = parsed[key];
-      if (entry?.data && typeof entry.at === "number") cache.set(key, entry);
-    }
+    parsed = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
   } catch {
     // No persisted cache yet.
+    return;
+  }
+
+  if (!parsed || typeof parsed !== "object") return;
+  cache.clear();
+  for (const key of Object.keys(parsed) as UsageProviderKey[]) {
+    const entry = parsed[key];
+    if (entry?.data && typeof entry.at === "number") cache.set(key, entry);
   }
 }
 
@@ -83,6 +97,50 @@ function saveCache() {
   } catch {
     // Best-effort cache only.
   }
+}
+
+function tryAcquireLock(): boolean {
+  try {
+    fs.mkdirSync(LOCK_DIR);
+    return true;
+  } catch (err: any) {
+    if (err?.code !== "EEXIST") return false;
+  }
+
+  try {
+    const stat = fs.statSync(LOCK_DIR);
+    if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+      try { fs.rmdirSync(LOCK_DIR); } catch {}
+      try {
+        fs.mkdirSync(LOCK_DIR);
+        return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+function releaseLock() {
+  try { fs.rmdirSync(LOCK_DIR); } catch {}
+}
+
+function getCacheFileMtimeMs(): number {
+  try { return fs.statSync(CACHE_FILE).mtimeMs; } catch { return 0; }
+}
+
+function getCacheFileAgeMs(): number {
+  const mtime = getCacheFileMtimeMs();
+  return mtime ? Date.now() - mtime : Infinity;
+}
+
+async function waitForCacheUpdate(timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  const initialMtime = getCacheFileMtimeMs();
+  while (Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
+    if (getCacheFileMtimeMs() > initialMtime) return true;
+  }
+  return false;
 }
 
 function formatDuration(seconds: number): string {
@@ -354,17 +412,44 @@ async function withTimeout<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<
 
 async function getUsage(provider: UsageProvider, force = false): Promise<UsageData> {
   loadCache();
-  const cached = cache.get(provider.key);
-  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    cached.data.refreshedAt = cached.data.refreshedAt ?? cached.at;
-    return cached.data;
+
+  if (!force) {
+    reloadCacheFromDisk();
+    const cached = cache.get(provider.key);
+    if (cached) {
+      // Errors get an escalating backoff; success uses the normal TTL.
+      const ttl = cached.data.error ? cached.data.errorBackoffMs ?? CACHE_TTL_MS : CACHE_TTL_MS;
+      if (Date.now() - cached.at < ttl) {
+        cached.data.refreshedAt = cached.data.refreshedAt ?? cached.at;
+        return cached.data;
+      }
+    }
+  }
+
+  if (!tryAcquireLock()) {
+    const updated = await waitForCacheUpdate(REQUEST_TIMEOUT_MS + 2_000);
+    if (updated) reloadCacheFromDisk();
+
+    const cached = cache.get(provider.key);
+    if (cached) {
+      cached.data.refreshedAt = cached.data.refreshedAt ?? cached.at;
+      return cached.data;
+    }
+
+    return {
+      windowLabel: "5h",
+      window: 0,
+      weekly: 0,
+      error: "waiting for usage refresh",
+    };
   }
 
   try {
+    reloadCacheFromDisk();
     const auth = AuthStorage.create();
     const token = provider.getToken ? await provider.getToken(auth) : await auth.getApiKey(provider.oauthProviderId);
     if (!token) {
-      return { windowLabel: "5h", window: 0, weekly: 0, error: `missing ${provider.oauthProviderId} token; try /login` };
+      return cacheError(provider, `missing ${provider.oauthProviderId} token; try /login`);
     }
 
     const data = await withTimeout((signal) => provider.fetch(token, signal));
@@ -373,13 +458,30 @@ async function getUsage(provider: UsageProvider, force = false): Promise<UsageDa
     saveCache();
     return data;
   } catch (err) {
-    return {
-      windowLabel: "5h",
-      window: 0,
-      weekly: 0,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return cacheError(provider, err instanceof Error ? err.message : String(err));
+  } finally {
+    releaseLock();
   }
+}
+
+// Persist failures too, with an escalating backoff, so the throttle gate also
+// applies to errors. Without this, a 429 never updates the cache and every
+// session_start / model_select / timer tick re-fires immediately (error storm).
+function cacheError(provider: UsageProvider, message: string): UsageData {
+  const prev = cache.get(provider.key);
+  const prevBackoff = prev?.data.error ? prev.data.errorBackoffMs ?? 0 : 0;
+  const backoff = Math.min(prevBackoff > 0 ? prevBackoff * 2 : ERROR_BACKOFF_BASE_MS, ERROR_BACKOFF_MAX_MS);
+  const data: UsageData = {
+    windowLabel: "5h",
+    window: 0,
+    weekly: 0,
+    error: message,
+    refreshedAt: Date.now(),
+    errorBackoffMs: backoff,
+  };
+  cache.set(provider.key, { data, at: data.refreshedAt });
+  saveCache();
+  return data;
 }
 
 function compactUsage(provider: UsageProvider, data: UsageData): string {
@@ -549,7 +651,7 @@ async function updateStatus(ctx: ExtensionContext, provider: UsageProvider | und
   if (cached) {
     usageInlineText = compactUsage(provider, cached.data);
     requestFooterRender?.();
-    if (!force) return;
+    if (!force && getCacheFileAgeMs() < CACHE_TTL_MS) return;
   }
 
   const data = await getUsage(provider, force);
@@ -579,8 +681,41 @@ async function refreshCurrentUsage(force = false) {
 function startBackgroundRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
-    void refreshCurrentUsage(true);
+    void refreshCurrentUsage(false);
   }, BACKGROUND_REFRESH_MS);
+}
+
+function refreshInlineFromCache() {
+  reloadCacheFromDisk();
+  const provider = detectUsageProvider(selectedModel ?? currentContext?.model);
+  if (!provider) return;
+
+  const cached = cache.get(provider.key);
+  if (cached) {
+    cached.data.refreshedAt = cached.data.refreshedAt ?? cached.at;
+    usageInlineText = compactUsage(provider, cached.data);
+    requestFooterRender?.();
+  }
+}
+
+function startCacheWatcher() {
+  stopCacheWatcher();
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    cacheWatcher = fs.watch(path.dirname(CACHE_FILE), { persistent: false }, (_event, filename) => {
+      if (filename && filename !== path.basename(CACHE_FILE)) return;
+      refreshInlineFromCache();
+    });
+  } catch {
+    // Best effort only; timer-based refresh still works.
+  }
+}
+
+function stopCacheWatcher() {
+  if (cacheWatcher) {
+    cacheWatcher.close();
+    cacheWatcher = undefined;
+  }
 }
 
 function stopBackgroundRefresh() {
@@ -602,12 +737,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     installFooter(ctx);
+    startCacheWatcher();
     startBackgroundRefresh();
     await updateStatus(ctx, detectUsageProvider(ctx.model));
   });
 
   pi.on("session_shutdown", async () => {
     stopBackgroundRefresh();
+    stopCacheWatcher();
+    releaseLock();
   });
 
   pi.registerCommand("usage", {
